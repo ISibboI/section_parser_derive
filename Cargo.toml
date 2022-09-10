@@ -1,6 +1,6 @@
 [package]
 name = "section_parser_derive"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "BSD-2-Clause"
 description = "This just exists because I cannot define derive macros inside my binary :("
