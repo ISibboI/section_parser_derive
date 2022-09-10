@@ -1,11 +1,17 @@
-use proc_macro::{TokenStream};
-use convert_case::{Case, Casing};
-use proc_macro2::Span;
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use syn::{parse_macro_input, Ident, Data, DataStruct, DeriveInput, Fields, Type, PathArguments, GenericArgument};
+use syn::{
+    parse_macro_input, Data, DataStruct, DeriveInput, Fields, GenericArgument, Ident,
+    PathArguments, Type,
+};
+
+struct FieldProperties {
+    ident: Ident,
+    ty: Type,
+}
 
 #[proc_macro_derive(SectionParser)]
-pub fn derive_section_parser(item: TokenStream) -> TokenStream {
+pub fn derive_section_parser(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let DeriveInput {
         ident: struct_ident,
         data,
@@ -25,64 +31,92 @@ pub fn derive_section_parser(item: TokenStream) -> TokenStream {
         _ => panic!("SectionParser can only be derived on structs with named fields"),
     };
 
-    let error_ident = Ident::new(
-        &format!("{}Error", struct_ident.to_string()),
-        Span::call_site(),
-    );
+    let error_ident = Ident::new(&format!("{}Error", struct_ident), Span::call_site());
 
     let mut parsed_fields = Vec::new();
-    let mut errors = Vec::new();
 
     for field in fields.named {
-        let ident = field
-            .ident
-            .expect("Expected named field");
+        let ident = field.ident.expect("Expected named field");
         let path = match field.ty {
             Type::Path(path) => path.path.segments,
             _ => continue,
         };
-        let first_segment = path.into_iter().next().expect("Expected type with at least one element");
-        if first_segment.ident.to_string() != "Option" {
+        let first_segment = path
+            .into_iter()
+            .next()
+            .expect("Expected type with at least one element");
+        if first_segment.ident != "Option" {
             continue;
         }
         let option_type_arguments = match first_segment.arguments {
             PathArguments::AngleBracketed(arguments) => arguments.args,
-            _ => panic!("Expected angle bracketed arguments for Option, but got {:?}", first_segment.arguments),
+            _ => panic!(
+                "Expected angle bracketed arguments for Option, but got {:?}",
+                first_segment.arguments
+            ),
         };
-        let type_argument = option_type_arguments.into_iter().next().expect("Expected one type argument for Option");
+        let type_argument = option_type_arguments
+            .into_iter()
+            .next()
+            .expect("Expected one type argument for Option");
         let ty = match type_argument {
             GenericArgument::Type(ty) => ty,
-            _ => panic!("Expected a type argument for Option, but got {:?}", type_argument),
+            _ => panic!(
+                "Expected a type argument for Option, but got {:?}",
+                type_argument
+            ),
         };
 
-        let camelcase_ident = ident.to_string().to_case(Case::Camel);
-        let unexpected_error = format!("Unexpected{camelcase_ident}");
-        let duplicate_error = format!("Duplicate{camelcase_ident}");
-        let missing_error = format!("Missing{camelcase_ident}");
+        parsed_fields.push(FieldProperties { ident, ty });
+    }
 
-        let setter = Ident::new(&format!("set_{}", ident.to_string()), Span::call_site());
-
-        output.push(quote!{
-            impl #struct_ident {
-                fn #setter(&mut self, #ident: #ty) -> ::std::result::Result<(), #error_ident> {
-                    if self.#ident.is_none() {
-                        self.#ident = ::std::option::Option::Some(#ident);
-                        ::std::result::Result::Ok(())
-                    } else {
-                        ::std::result::Result::Err(#error_ident::#unexpected_error)
-                    }
-                }
-
+    let getters: TokenStream = parsed_fields
+        .iter()
+        .map(|FieldProperties { ident, ty, .. }| {
+            quote! {
                 fn #ident(&mut self) -> ::std::result::Result<#ty, #error_ident> {
                     self.#ident.take().ok_or_else(|| {
-                        #error_ident::#missing_error
+                        self.missing_field_error(stringify!(#ident))
                     })
                 }
             }
-        });
+        })
+        .collect();
 
-        errors.extend([unexpected_error, duplicate_error, missing_error]);
-    }
+    let setters: TokenStream = parsed_fields.iter().map(|FieldProperties {ident, ty, .. }| {
+        let setter = Ident::new(&format!("set_{}", ident), Span::call_site());
+        quote! {
+            fn #setter(&mut self, #ident: #ty) -> ::std::result::Result<(), #error_ident> {
+                if let Some(#ident) = self.#ident.take() {
+                    ::std::result::Result::Err(self.duplicate_field_error(stringify!(#ident), #ident))
+                } else {
+                    self.#ident = ::std::option::Option::Some(#ident);
+                    ::std::result::Result::Ok(())
+                }
+            }
+        }
+    }).collect();
 
-    todo!()
+    let ensure_empty_checks: TokenStream = parsed_fields.iter().map(|FieldProperties { ident, .. }| {
+        quote! {
+            if let ::std::option::Option::Some(#ident) = self.#ident.take() {
+                return ::std::result::Result::Err(self.unexpected_field_error(stringify!(#ident), #ident));
+            }
+        }
+    }).collect();
+
+    let result = quote! {
+        impl #struct_ident {
+            #getters
+
+            #setters
+
+            fn ensure_empty(mut self) -> ::std::result::Result<(), #error_ident> {
+                #ensure_empty_checks
+
+                ::std::result::Result::Ok(())
+            }
+        }
+    };
+    result.into()
 }
